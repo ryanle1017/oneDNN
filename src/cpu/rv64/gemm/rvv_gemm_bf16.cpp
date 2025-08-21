@@ -38,58 +38,46 @@ using namespace gemm_utils;
 
 namespace {
 
-// 🚀 RVV优化的bf16→f32转换函数，基于RVV 1.0规范
 inline void rvv_cvt_bf16_to_f32_vector(float *out, const bfloat16_t *inp, size_t nelems) {
     size_t i = 0;
     while (i < nelems) {
-        // 使用e16m1处理bf16输入，e32m2处理f32输出以保持吞吐量
         size_t vl = __riscv_vsetvl_e16m1(nelems - i);
-        
-        // 加载bf16数据作为uint16
+
         vuint16m1_t v_bf16 = __riscv_vle16_v_u16m1((const uint16_t*)(inp + i), vl);
-        
-        // bf16→f32转换：零扩展到32位并左移16位
-        // 这是标准的bf16→f32转换：bf16占据f32的高16位
+
         vuint32m2_t v_f32_bits = __riscv_vzext_vf2_u32m2(v_bf16, vl);
         v_f32_bits = __riscv_vsll_vx_u32m2(v_f32_bits, 16, vl);
-        
-        // 重新解释为float32
+
         vfloat32m2_t v_f32 = __riscv_vreinterpret_v_u32m2_f32m2(v_f32_bits);
-        
-        // 存储f32值
+
         __riscv_vse32_v_f32m2(out + i, v_f32, vl);
-        
+
         i += vl;
     }
 }
 
-// 🚀 bf16版本的copy_A函数，复用f32架构但加入bf16→f32转换
-void copy_A_bf16(bool isTransA, dim_t K, const bfloat16_t *A, const dim_t lda, float *ws) {
+void copy_A(bool isTransA, dim_t K, const bfloat16_t *A, const dim_t lda, float *ws) {
     constexpr dim_t m = unroll_factor_bf16<bfloat16_t>::m;
 
     for (dim_t k = 0; k < K; k++) {
         if (isTransA) {
-            // 转置情况：使用strided load优化
             dim_t i = 0;
             while (i < m) {
                 size_t vl = __riscv_vsetvl_e16m1(m - i);
                 ptrdiff_t stride = lda * sizeof(bfloat16_t);
                 const bfloat16_t *a_ptr = A + i * lda + k;
-                
-                // 加载bf16数据
+
                 vuint16m1_t v_a_bf16 = __riscv_vlse16_v_u16m1(
                     (const uint16_t*)a_ptr, stride, vl);
-                
-                // 转换为f32
+
                 vuint32m2_t v_a_f32_bits = __riscv_vzext_vf2_u32m2(v_a_bf16, vl);
                 v_a_f32_bits = __riscv_vsll_vx_u32m2(v_a_f32_bits, 16, vl);
                 vfloat32m2_t v_a_f32 = __riscv_vreinterpret_v_u32m2_f32m2(v_a_f32_bits);
-                
+
                 __riscv_vse32_v_f32m2(ws + i, v_a_f32, vl);
                 i += vl;
             }
         } else {
-            // 非转置情况：连续内存访问
             const bfloat16_t *a_ptr = A + k * lda;
             rvv_cvt_bf16_to_f32_vector(ws, a_ptr, m);
         }
@@ -97,9 +85,8 @@ void copy_A_bf16(bool isTransA, dim_t K, const bfloat16_t *A, const dim_t lda, f
     }
 }
 
-// 🚀 bf16版本的kernel_mxn，核心计算逻辑与f32相同，但输入需要bf16→f32转换
 template <bool isTransA, bool isTransB>
-void kernel_mxn_bf16(dim_t K, const bfloat16_t *A, const dim_t lda, const bfloat16_t *B,
+void kernel_mxn(dim_t K, const bfloat16_t *A, const dim_t lda, const bfloat16_t *B,
         const dim_t ldb, float *C, const dim_t ldc, const float alpha,
         const float beta, int ithr = -1) {
     constexpr dim_t m = unroll_factor_bf16<bfloat16_t>::m;
@@ -107,51 +94,43 @@ void kernel_mxn_bf16(dim_t K, const bfloat16_t *A, const dim_t lda, const bfloat
 
     float c[m * n] = {0.0f};
 
-    // 🔄 K循环：逐步加载bf16数据并转换为f32进行计算
     for (dim_t k = 0; k < K; k++) {
         dim_t i = 0;
         while (i < m) {
             size_t vl = __riscv_vsetvl_e16m1(m - i);
             vfloat32m2_t v_a;
-            
+
             if (isTransA) {
-                // 转置A：使用strided load
                 ptrdiff_t stride_a = lda * sizeof(bfloat16_t);
                 vuint16m1_t v_a_bf16 = __riscv_vlse16_v_u16m1(
                     (const uint16_t*)(A + i * lda + k), stride_a, vl);
-                
-                // bf16→f32转换
+
                 vuint32m2_t v_a_f32_bits = __riscv_vzext_vf2_u32m2(v_a_bf16, vl);
                 v_a_f32_bits = __riscv_vsll_vx_u32m2(v_a_f32_bits, 16, vl);
                 v_a = __riscv_vreinterpret_v_u32m2_f32m2(v_a_f32_bits);
             } else {
-                // 非转置A：连续加载
                 vuint16m1_t v_a_bf16 = __riscv_vle16_v_u16m1(
                     (const uint16_t*)(A + i + k * lda), vl);
-                
-                // bf16→f32转换
+
                 vuint32m2_t v_a_f32_bits = __riscv_vzext_vf2_u32m2(v_a_bf16, vl);
                 v_a_f32_bits = __riscv_vsll_vx_u32m2(v_a_f32_bits, 16, vl);
                 v_a = __riscv_vreinterpret_v_u32m2_f32m2(v_a_f32_bits);
             }
-            
+
             for (dim_t j = 0; j < n; j++) {
-                // 加载B元素并转换为f32
                 bfloat16_t b_bf16 = isTransB ? B[j + k * ldb] : B[k + j * ldb];
-                float b = static_cast<float>(b_bf16);  // 使用oneDNN的转换
-                
+                float b = static_cast<float>(b_bf16);
+
                 float *c_col_ptr = c + m * j + i;
                 vfloat32m2_t v_c = __riscv_vle32_v_f32m2(c_col_ptr, vl);
-                
-                // 🚀 核心FMA运算：v_c = v_c + b * v_a
+
                 v_c = __riscv_vfmacc_vf_f32m2(v_c, b, v_a, vl);
                 __riscv_vse32_v_f32m2(c_col_ptr, v_c, vl);
             }
             i += vl;
         }
     }
-    
-    // 🔄 结果累加到最终矩阵C，与f32版本相同
+
     for (dim_t j = 0; j < n; j++) {
         dim_t i = 0;
         while (i < m) {
@@ -177,38 +156,32 @@ void kernel_mxn_bf16(dim_t K, const bfloat16_t *A, const dim_t lda, const bfloat
     }
 }
 
-// 🚀 bf16版本的block_ker，复用f32架构
 template <bool isTransA, bool isTransB>
-void block_ker_bf16(const dim_t M, const dim_t N, const dim_t K, const bfloat16_t *A,
+void block_ker(const dim_t M, const dim_t N, const dim_t K, const bfloat16_t *A,
         const dim_t lda, const bfloat16_t *B, const dim_t ldb, float *C,
         const dim_t ldc, const float alpha, const float beta, float *ws,
         bool do_copy, int ithr = -1) {
 
-    // 🔧 计算对齐的块大小
     constexpr dim_t m = unroll_factor_bf16<bfloat16_t>::m;
     constexpr dim_t n = unroll_factor_bf16<bfloat16_t>::n;
     dim_t Nu = (N / n) * n;
     dim_t Mu = (M / m) * m;
 
-    // 🔄 主循环：处理对齐的块
     for (dim_t i = 0; i < Mu; i += m) {
         for (dim_t j = 0; j < Nu; j += n) {
             const bfloat16_t *b = isTransB ? &B[j] : &B[j * ldb];
             const bfloat16_t *a = isTransA ? &A[i * lda] : &A[i];
             if (do_copy) {
-                if (j == 0) { copy_A_bf16(isTransA, K, a, lda, ws); }
-                // 注意：copy_A_bf16将bf16转换为f32存储在ws中，所以这里需要特殊处理
-                // 暂时使用非copy版本，后续优化
-                kernel_mxn_bf16<isTransA, isTransB>(K, a, lda, b, ldb,
+                if (j == 0) { copy_A(isTransA, K, a, lda, ws); }
+                kernel_mxn<isTransA, isTransB>(K, a, lda, b, ldb,
                         &C[i + j * ldc], ldc, alpha, beta, ithr);
             } else {
-                kernel_mxn_bf16<isTransA, isTransB>(K, a, lda, b, ldb,
+                kernel_mxn<isTransA, isTransB>(K, a, lda, b, ldb,
                         &C[i + j * ldc], ldc, alpha, beta, ithr);
             }
         }
     }
 
-    // 🔄 尾部处理：回退到标量实现
     for (dim_t i = 0; i < M; i++) {
         for (dim_t j = Nu; j < N; j++) {
             float c = beta == 0.f ? 0.f : beta * C[i + j * ldc];
@@ -235,14 +208,12 @@ void block_ker_bf16(const dim_t M, const dim_t N, const dim_t K, const bfloat16_
     }
 }
 
-// 🚀 bf16版本的gemm_ithr，复用f32的线程调度逻辑
 template <bool isTransA, bool isTransB>
-void gemm_ithr_bf16(const dim_t M, const dim_t N, const dim_t K, const float alpha,
+void gemm_ithr(const dim_t M, const dim_t N, const dim_t K, const float alpha,
         const bfloat16_t *A, const dim_t lda, const bfloat16_t *B, const dim_t ldb,
         const float beta, float *C, const dim_t ldc, bool do_copy, float *ws,
         int ithr = -1) {
 
-    // 🔧 使用与f32相同的固定block size策略
     constexpr dim_t BM = gemm_traits_t<bfloat16_t, isTransA, isTransB>::BM;
     constexpr dim_t BN = gemm_traits_t<bfloat16_t, isTransA, isTransB>::BN;
     constexpr dim_t BK = gemm_traits_t<bfloat16_t, isTransA, isTransB>::BK;
@@ -256,7 +227,6 @@ void gemm_ithr_bf16(const dim_t M, const dim_t N, const dim_t K, const float alp
     if ((K <= 0) || (alpha == 0.f)) {
         dim_t MN = N * M;
         if (beta == 0.f) {
-            // 🚀 向量化矩阵清零
             dim_t j = 0;
             while (j < MN) {
                 size_t vl = __riscv_vsetvl_e32m1(MN - j);
@@ -265,7 +235,6 @@ void gemm_ithr_bf16(const dim_t M, const dim_t N, const dim_t K, const float alp
                 j += vl;
             }
         } else if (beta != 1.f) {
-            // 🚀 向量化矩阵缩放
             dim_t j = 0;
             while (j < MN) {
                 size_t vl = __riscv_vsetvl_e32m1(MN - j);
@@ -289,10 +258,10 @@ void gemm_ithr_bf16(const dim_t M, const dim_t N, const dim_t K, const float alp
                 curC = &C[Bm + Bn * ldc];
 
                 if (Bk == 0) {
-                    block_ker_bf16<isTransA, isTransB>(mb, nb, kb, curA, lda, curB,
+                    block_ker<isTransA, isTransB>(mb, nb, kb, curA, lda, curB,
                             ldb, curC, ldc, alpha, beta, ws, do_copy, ithr);
                 } else {
-                    block_ker_bf16<isTransA, isTransB>(mb, nb, kb, curA, lda, curB,
+                    block_ker<isTransA, isTransB>(mb, nb, kb, curA, lda, curB,
                             ldb, curC, ldc, alpha, 1.0f, ws, do_copy, ithr);
                 }
             }
@@ -302,15 +271,13 @@ void gemm_ithr_bf16(const dim_t M, const dim_t N, const dim_t K, const float alp
 
 } // namespace
 
-// 🚀 主要的bf16 GEMM函数，API与f32版本保持一致
 dnnl_status_t rvv_gemm_bf16bf16f32(const char *transa_, const char *transb_,
         const dim_t *M_, const dim_t *N_, const dim_t *K_, const float *alpha_,
         const bfloat16_t *A, const dim_t *lda_, const bfloat16_t *B, const dim_t *ldb_,
         const float *beta_, float *C, const dim_t *ldc_) {
 
-    
+    printf("DEBUG: RVV bf16 GEMM called: M=%ld, N=%ld, K=%ld\n", *M_, *N_, *K_);
 
-    // 🔍 参数验证，与f32版本相同
     if (!(utils::one_of(*transa_, 'n', 'N', 't', 'T')
                 && utils::one_of(*transb_, 'n', 'N', 't', 'T')))
         return dnnl_unimplemented;
@@ -321,22 +288,19 @@ dnnl_status_t rvv_gemm_bf16bf16f32(const char *transa_, const char *transb_,
     const dim_t lda = *lda_, ldb = *ldb_, ldc = *ldc_;
     const float alpha = *alpha_, beta = *beta_;
 
-    // early out and avoid division by zero in partitioning
     if (utils::one_of(0, M, N)) return dnnl_success;
 
-    // 🔧 简化版本：单线程实现，避免复杂的线程管理
-    const bool do_copy = false;  // 暂时禁用copy优化
+    const bool do_copy = false;
     float *ws = nullptr;
 
-    // 🚀 根据transpose组合调用对应的模板实例
     if (!isTransA && !isTransB) {
-        gemm_ithr_bf16<false, false>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
+        gemm_ithr<false, false>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
     } else if (!isTransA && isTransB) {
-        gemm_ithr_bf16<false, true>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
+        gemm_ithr<false, true>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
     } else if (isTransA && !isTransB) {
-        gemm_ithr_bf16<true, false>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
+        gemm_ithr<true, false>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
     } else {
-        gemm_ithr_bf16<true, true>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
+        gemm_ithr<true, true>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, do_copy, ws);
     }
 
     return dnnl_success;
